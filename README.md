@@ -1,6 +1,6 @@
 # ECE 2026 - Big Data - labs
 
-Sommaire : [TP3 - object storage](#tp3---cloud-storage-et-object-storage) · [TP4 - SQL analytics avec DuckDB](#tp4---sql-analytics-avec-duckdb)
+Sommaire : [TP3 - object storage](#tp3---cloud-storage-et-object-storage) · [TP4 - SQL analytics avec DuckDB](#tp4---sql-analytics-avec-duckdb) · [TP5 - bronze vers silver avec dbt](#tp5---bronze-vers-silver-avec-dbt)
 
 ## TP3 - Cloud storage et object storage
 
@@ -98,3 +98,64 @@ duckdb analytics.duckdb -init init.sql < sql/tp4_exercises.sql
 Le CSV oblige à tout télécharger pour lire 2 colonnes, le Parquet lit le footer puis seulement les colonnes `product` et `quantity`. Le gros fichier fait 11,5 Mo en Parquet contre 29,6 Mo en CSV, et le petit `orders` 130 Ko contre 332 Ko. Le filtre sur 2100 ne lit que le footer : les stats min/max des 3 row groups montrent qu'aucun ne peut contenir de date après 2048.
 
 Les réponses aux questions du lab sont dans mon rendu envoyé par mail.
+
+## TP5 - Bronze vers silver avec dbt
+
+Toujours sur Onyxia. dbt-core 1.12.5 + dbt-duckdb 1.11.0 ajoutés au projet uv, projet dbt dans `lab_medallion/`. DuckDB lit les CSV du bronze directement sur S3 avec le secret `s3_onyxia_connection` du TP4.
+
+```
+cd lab_medallion
+export LAB_BUCKET_NAME=$KUBERNETES_NAMESPACE
+uv run dbt build        # seeds + modèles silver + tests
+uv run dbt docs generate --static
+```
+
+Contenu :
+- `models/bronze/sources.yml` : `users` et `orders` déclarés comme sources, `external_location` = `read_csv` sur `s3://<bucket>/bronze/{name}.csv`
+- `models/silver/stg_users.sql`, `stg_orders.sql` : typage, renommage, découpage de l'adresse, dédoublonnage des commandes
+- `models/silver/silver.yml` : documentation et tests génériques
+- `tests/` : tests singuliers, et `tests/generic/test_positive.sql` (test générique maison)
+- `seeds/states.csv` (codes des états, territoires et zones militaires) et `seeds/state_zip_ranges.csv` (plages de ZIP par état)
+
+### Ce qui s'est passé
+
+- `dbt test` : les 13 tests génériques passent, ainsi que `assert_orders_have_users`. `--store-failures` crée bien une table par test dans le schéma `main_dbt_test__audit`.
+- `assert_orders_after_user_birth` échoue avec **288 commandes** : 5 users sont nés après leur première commande (par exemple dayderek né le 2026-10-02 alors que ses commandes datent de février 2020). Faker génère les dates de naissance par rapport à aujourd'hui alors que les commandes sont en 2020. Passé en `severity='warn'` comme demandé, puis corrigé dans l'exercice 3.
+- `dbt build --select silver` sur une base vide plante sur le test `relationships` vers `states` : le seed n'est pas dans la sélection, donc la table n'existe pas. Il faut lancer `dbt build` tout court (ou `dbt seed` avant).
+- `dbt ls --select +stg_orders` donne bien `source:lab_medallion.bronze.orders` + `stg_orders`.
+- Export Parquet : `silver/dbt/users.parquet` (7 Ko) et `silver/dbt/orders.parquet` (72 Ko). La comparaison avec la vue (`EXCEPT ALL` dans les deux sens) donne 2829 lignes des deux côtés et 0 différence.
+- Le `.gitignore` du TP3 ignore `*.csv`, j'ai dû ajouter une exception pour `lab_medallion/seeds/*.csv` sinon les seeds n'étaient pas commités.
+
+### Exercices
+
+1. **`username_normalized`** = `lower(trim(username))`, documentée, tests `unique` + `not_null`.
+2. **Tests des commandes** : `quantity` avec `not_null`, mon test générique `positive` et `accepted_values` 1 à 5, `product` avec `not_null` + `accepted_values`, `user_id` avec `relationships` vers `stg_users` (générique) en plus du test singulier `assert_orders_have_users`. Tout passe.
+3. **Dates de naissance invalides** : `stg_users` calcule la première commande de chaque user depuis la source `orders`, `birthdate_is_valid` vaut false si la naissance est après cette commande, et dans ce cas `birthdate` est mise à NULL. 5 users sur 50 sont concernés. Le test `assert_orders_after_user_birth` filtre sur `birthdate_is_valid` et repasse en erreur bloquante : il passe.
+4. **ZIP incohérents** : seed `state_zip_ranges` (préfixes ZIP à 3 chiffres de l'USPS pour chaque état, territoire et zone militaire AA/AE/AP) et test singulier `assert_users_zip_matches_state` en `warn`. Résultat : **49 users sur 50** ont un ZIP qui ne correspond pas à leur état (ex : TX 55834, alors que 55xxx c'est le Minnesota), seul 1 tombe juste par hasard. Faker tire l'état et le ZIP indépendamment.
+   - La donnée de référence devrait venir d'une source officielle (USPS ou les ZCTA du Census), versionnée. En seed c'est bien parce qu'elle est petite (71 lignes) et change rarement ; pour une vraie table ZIP complète (~40 000 codes) je la chargerais plutôt comme une source à part.
+   - La validation a sa place dans le silver (c'est là qu'on nettoie), en warning pour ne pas bloquer le pipeline, ou avec une colonne `zip_is_valid` comme pour la date de naissance.
+   - Si la référence change, il suffit de relancer `dbt seed` + `dbt build` : comme le bronze n'est jamais modifié, tout le silver se recalcule.
+5. **Vue vs table** (testé puis remis en `view`) :
+
+| | view | table |
+|---|---|---|
+| taille de `lab_medallion.duckdb` | 0,8 Mo | 1,8 Mo |
+| `SELECT count(*) FROM main_silver.stg_orders` | 0,39 s | 0,000 s |
+| transformation exécutée | à chaque requête | au `dbt run` |
+| si le CSV change | visible tout de suite | visible seulement après un nouveau `dbt run` |
+
+La vue ne stocke que la requête, donc chaque lecture retélécharge et reparse le CSV sur S3. La table stocke le résultat dans le fichier DuckDB (plus de place) mais les lectures ne touchent plus au bronze.
+
+### Questions du lab
+
+**Le bronze n'est jamais modifié. Quel intérêt si on trouve un bug dans une transformation six mois plus tard ?** On corrige le modèle et on relance `dbt build` : tout le silver est recalculé depuis les données brutes d'origine. Si on avait écrasé le bronze avec les données transformées, les données d'origine seraient perdues et le bug impossible à rattraper.
+
+**La source relit tout le fichier à chaque requête. Quel format et quelle organisation si les commandes arrivaient toutes les heures pendant des années ?** Du Parquet partitionné par date (`date=2026-10-07/` voire `/hour=08/`), ou une table Iceberg qui gère les partitions et les métadonnées. Chaque ingestion ajoute des fichiers sans réécrire l'existant, les requêtes ne lisent que les partitions utiles, et côté dbt un modèle `incremental` ne traiterait que les nouvelles partitions.
+
+**Les modèles silver sont des vues. Que se passe-t-il quand on interroge une vue, et quand est-ce préférable à une table ?** La requête de la vue est exécutée à chaque fois, ici ça veut dire relire les CSV sur S3. C'est préférable quand les données sont petites, peu interrogées ou qu'on veut toujours la dernière version de la source sans relancer dbt, et ça ne prend pas de place. Dès que c'est lu souvent ou que c'est lourd à calculer, une table est mieux.
+
+**Un UUID est stocké sur 16 octets. Combien en `VARCHAR` ?** 36 caractères (32 hexadécimaux + 4 tirets), donc 36 octets, plus de 2 fois plus. Et dans DuckDB une chaîne de plus de 12 caractères n'est pas stockée en ligne, il faut en plus un en-tête de 16 octets avec un pointeur.
+
+**Quelle stratégie pour un dashboard sur l'âge des clients ? Et pour les ventes par région ?** Pour l'âge, mettre les dates invalides à NULL (et les exclure du calcul) : un âge faux fausserait le dashboard et on ne doit pas inventer de valeur. Pour les ventes par région, surtout ne pas rejeter les users concernés : leur date de naissance n'a rien à voir avec les ventes et on perdrait leurs commandes. C'est pour ça que j'ai gardé les lignes avec `birthdate` à NULL + `birthdate_is_valid` plutôt que de les supprimer.
+
+**Les adresses associent des états à des ZIP aléatoires (`KY 01352`). Quel test le détecterait, avec quelles données de référence ?** Un test qui vérifie que le ZIP est dans une des plages de son état, avec une table de référence état → plages de ZIP (USPS / Census). C'est ce que j'ai fait dans l'exercice 4 : `KY 01352` est bien détecté (01xxx c'est le Massachusetts).
