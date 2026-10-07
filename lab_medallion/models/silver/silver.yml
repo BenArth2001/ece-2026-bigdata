@@ -7,6 +7,11 @@ models:
         data_tests:
           - unique
           - not_null
+      - name: username_normalized
+        description: Username without leading/trailing spaces and in lowercase, to compare usernames whatever their case.
+        data_tests:
+          - unique
+          - not_null
       - name: email
         data_tests:
           - unique
@@ -16,6 +21,12 @@ models:
           - accepted_values:
               arguments:
                 values: ["F", "M"]
+      - name: birthdate
+        description: Birthdate of the user, NULL when it is later than the first order of the user.
+      - name: birthdate_is_valid
+        description: False when the original birthdate is later than the first order, the birthdate is then replaced with NULL.
+        data_tests:
+          - not_null
       - name: state
         description: Two letters code of the state, territory or military region.
         data_tests:
@@ -24,6 +35,8 @@ models:
               arguments:
                 to: ref('states')
                 field: code
+      - name: zip_code
+        description: Five digits ZIP code. Its consistency with the state is checked by assert_users_zip_matches_state.
 
   - name: stg_orders
     description: One row per order, typed and deduplicated.
@@ -41,12 +54,15 @@ models:
                 field: user_id
       - name: quantity
         data_tests:
+          - not_null
+          - positive
           - accepted_values:
               arguments:
                 values: [1, 2, 3, 4, 5]
                 quote: false
       - name: product
         data_tests:
+          - not_null
           - accepted_values:
               arguments:
                 values: ["bread", "brioche", "cookie", "croissant", "donut", "drink"]

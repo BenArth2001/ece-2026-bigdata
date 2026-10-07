@@ -13,6 +13,13 @@ clean-targets:
   - target
   - dbt_packages
 
+seeds:
+  lab_medallion:
+    state_zip_ranges:
+      +column_types:
+        zip_min: varchar
+        zip_max: varchar
+
 models:
   lab_medallion:
     silver:
