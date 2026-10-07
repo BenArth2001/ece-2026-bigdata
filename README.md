@@ -1,10 +1,14 @@
-# ECE 2026 - Big Data - TP3 Cloud storage et object storage
+# ECE 2026 - Big Data - labs
+
+Sommaire : [TP3 - object storage](#tp3---cloud-storage-et-object-storage) · [TP4 - SQL analytics avec DuckDB](#tp4---sql-analytics-avec-duckdb)
+
+## TP3 - Cloud storage et object storage
 
 Arthur Benatar - ING5 groupe 1
 
 Tout a été fait dans un service vscode-pyspark sur Onyxia (Adaltas), avec mon bucket `user-a-benatar-ece` sur l'endpoint SeaweedFS https://s3.seaweedfs.adm.adaltas.cloud
 
-## Lab 1 - génération des datasets
+### Lab 1 - génération des datasets
 
 Projet Python géré avec uv, nom du projet `ece-2026-bigdata`, package `ece_2026_bigdata`.
 
@@ -23,7 +27,7 @@ uv run dataset-orders
 
 J'ai mis une seed à 42 sur Faker pour que les données soient les mêmes à chaque exécution, sinon c'est pénible pour comparer les fichiers entre deux runs.
 
-## Lab 2 - object storage S3
+### Lab 2 - object storage S3
 
 Opérations faites sur le bucket : upload, list, download, mv, delete, ajout de métadonnées, presigned URL, upload multipart d'un fichier de 200 MiB, versioning et lifecycle.
 
@@ -39,7 +43,7 @@ Consistency : la section s'est terminée avec un code 2, à priori à cause du `
 
 Job Kubernetes : le pod ne se créait pas, erreur `failed quota: onyxia-quota: must specify limits.cpu`. Le namespace Onyxia a un quota qui oblige à mettre des limits, j'ai donc ajouté `limits.cpu: 500m` dans `job-upload-bronze.yaml`. Après ça le job passe et dans `bronze/` on retrouve `users.csv` (7351 octets) et `orders.csv` (331568 octets). J'ai supprimé les objets Kubernetes à la fin mais j'ai gardé les données dans bronze pour la suite.
 
-## Questions
+### Questions
 
 1. Pourquoi les credentials sont dans un Secret et pas dans la ConfigMap ?
 
@@ -52,3 +56,45 @@ Les credentials S3 d'Onyxia ont une durée de vie limitée (token STS). Si on re
 3. Comment transformer ce job en ingestion quotidienne ?
 
 Le plus simple est de passer du Job à un CronJob Kubernetes avec un schedule genre `0 2 * * *` pour tourner tous les jours à 2h. Il faut aussi que chaque run écrive dans un chemin daté (par exemple `bronze/users/date=2026-10-06/users.csv`) pour ne pas écraser les données de la veille et pouvoir rejouer un jour précis. Il faut penser à `concurrencyPolicy: Forbid` pour éviter que deux runs se chevauchent, à garder un historique des jobs (successfulJobsHistoryLimit / failedJobsHistoryLimit) et à régler le problème des credentials de la question 2. Si le pipeline grossit, un orchestrateur comme Airflow ou Argo Workflows serait plus adapté pour gérer les dépendances, les retries et le monitoring.
+
+## TP4 - SQL analytics avec DuckDB
+
+Fait dans le même service vscode-pyspark sur Onyxia, DuckDB v1.5.5 (préinstallé dans l'image), sur les fichiers `bronze/users.csv` et `bronze/orders.csv` de mon bucket.
+
+Ce qui a été ajouté au projet :
+- `src/ece_2026_bigdata/orders_report.py` + la commande `orders-report` dans `pyproject.toml` (rapport mensuel, filtre `-p` sur un produit)
+- `sql/tp4_exercises.sql` : mes requêtes pour les 5 exercices
+- `*.duckdb` et `init.sql` dans le `.gitignore` (ce n'est pas du code)
+
+```
+uv run orders-report            # 2020-01 744 2297 / 2020-02 696 2154 / 2020-03 744 2192 / 2020-04 645 1972
+uv run orders-report -p cookie  # 2020-01 128 376 / 2020-02 121 371 / ...
+duckdb analytics.duckdb -init init.sql < sql/tp4_exercises.sql
+```
+
+### Remarques
+
+- Le service tournait depuis la veille et les credentials S3 d'Onyxia avaient expiré (ils durent 12h). Le secret persistant `s3_onyxia_connection` garde les valeurs du démarrage, donc il a fallu le recréer avec des credentials neufs (`CREATE OR REPLACE PERSISTENT SECRET ...`), sinon toutes les lectures S3 tombent en 403.
+- `s5cmd` n'est pas dans mon image vscode-pyspark, j'ai utilisé `aws s3 cp` pour envoyer le gros fichier (multipart automatique, 28 MiB en 2 s).
+- Mon générateur ne donne pas exactement les chiffres de l'énoncé pour le gros dataset : 252 416 commandes et 29 Mo de CSV au lieu de 54 Mo. Les dates vont de 2020 à 2048 (une commande par heure), donc `date >= '2100-01-01'` ne renvoie rien.
+- Contrôles qualité : 0 commande orpheline, 0 user sans commande, 0 doublon d'uuid.
+
+### Exercices
+
+1. 56,58 commandes par user en moyenne (2829 / 50) et 3,05 de quantité moyenne par commande.
+2. `min`/`max` de la date par user + `date_diff('day', ...)`. Les commandes d'un user sont regroupées sur quelques jours (le générateur enchaîne les users), l'écart max est de 5 jours (hoganashlee) et 6 users ont tout commandé le même jour.
+3. 6h avec 385 articles, devant 15h (382) et minuit (379). Les écarts sont minuscules, c'est le hasard du générateur, pas une vraie heure de pointe.
+4. `lag(quantity) OVER (PARTITION BY product ORDER BY month)` sur les quantités mensuelles. Par exemple donut fait -28,3 % en février, bread +14,9 % en février puis -19,2 % en avril. Avril baisse souvent parce que les données s'arrêtent le 27.
+5. 45 users sur 50 ont commandé les 6 produits (`HAVING count(DISTINCT product) = 6`).
+
+### CSV vs Parquet
+
+| | données lues | GET | temps |
+|---|---|---|---|
+| CSV, `sum(quantity)` par produit | 28,2 MiB | 1 | 1,10 s |
+| Parquet, même requête | 203,5 KiB | 4 | 0,14 s |
+| Parquet, `count(*) WHERE date >= '2100-01-01'` | 16 KiB | 1 | 0,18 s |
+
+Le CSV oblige à tout télécharger pour lire 2 colonnes, le Parquet lit le footer puis seulement les colonnes `product` et `quantity`. Le gros fichier fait 11,5 Mo en Parquet contre 29,6 Mo en CSV, et le petit `orders` 130 Ko contre 332 Ko. Le filtre sur 2100 ne lit que le footer : les stats min/max des 3 row groups montrent qu'aucun ne peut contenir de date après 2048.
+
+Les réponses aux questions du lab sont dans mon rendu envoyé par mail.
